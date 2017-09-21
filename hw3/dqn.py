@@ -10,6 +10,8 @@ from dqn_utils import *
 
 OptimizerSpec = namedtuple("OptimizerSpec", ["constructor", "kwargs", "lr_schedule"])
 
+Action = int
+
 def learn(env,
           q_func,
           optimizer_spec,
@@ -129,6 +131,23 @@ def learn(env,
     
     # YOUR CODE HERE
 
+    action_values = q_func(obs_t_float, num_actions, scope="q_func_cur", reuse=False)
+    # Bellman Optimal Equal
+    act_t = tf.one_hot(act_t_ph, depth=num_actions, dtype=tf.float32, name="action_one_hot")
+    q_cur = tf.reduce_max(action_values * act_t, axis=1)
+
+    q_next = q_func(obs_tp1_float, num_actions, scope="q_func_next", reuse=False)
+
+    def T(q=q_next, r=rew_t_ph, gamma=gamma):
+        '''Bellman operator.'''
+        return r + (1 - done_mask_ph) * gamma * tf.reduce_max(q)
+
+    total_error = tf.losses.mean_squared_error(T(q_next), q_cur)
+    # total_error = tf.losses.mean_squared_error(T(q_next), Q[0])
+
+    q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='q_func_cur')
+    target_q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='q_func_next')
+
     ######
 
     # construct optimization op (with gradient clipping)
@@ -195,6 +214,29 @@ def learn(env,
         #####
         
         # YOUR CODE HERE
+        idx = replay_buffer.store_frame(last_obs)
+
+        if t == 0:
+            act, reward, done = env.action_space.sample(), 0, False
+
+        epsilon = exploration.value(t)
+
+        if not model_initialized or random.random() < epsilon:
+            act = env.action_space.sample()
+        else:
+            input_batch = replay_buffer.encode_recent_observation()
+            q_vals = session.run(action_values, {obs_t_ph: input_batch[None, :]})
+            act = np.argmax(q_vals)
+
+        obs, reward, done, _ = env.step(act)
+
+        if done:
+            env.reset()
+            done = False
+
+        replay_buffer.store_effect(idx, act, reward, done)
+
+        last_obs = obs
 
         #####
 
@@ -246,7 +288,34 @@ def learn(env,
             
             # YOUR CODE HERE
 
-            #####
+            # sample data from replay buffer for training
+            obs_batch, act_batch, rew_batch, next_obs_batch, done_mask = replay_buffer.sample(
+                batch_size)
+
+            # init vars
+            if not model_initialized:
+                initialize_interdependent_variables(
+                    session, tf.global_variables(), {
+                        obs_t_ph: obs_batch,
+                        obs_tp1_ph: obs_batch, })
+                model_initialized = True
+
+            # train model
+
+            session.run(
+                train_fn,
+                feed_dict={
+                    obs_t_ph: obs_batch,
+                    act_t_ph: act_batch,
+                    rew_t_ph: rew_batch,
+                    obs_tp1_ph: next_obs_batch,
+                    learning_rate: optimizer_spec.lr_schedule.value(t),
+                    done_mask_ph: done_mask, })
+
+            # update target network occasionally
+            if t % target_update_freq == 0:
+                session.run(update_target_fn)
+
 
         ### 4. Log progress
         episode_rewards = get_wrapper_by_name(env, "Monitor").get_episode_rewards()
